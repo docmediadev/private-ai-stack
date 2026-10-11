@@ -1,0 +1,98 @@
+# Private AI Stack — ollama + Open WebUI + Caddy(TLS) + restic backups
+# Tested on Debian 12/13. Copy .env.example -> .env and set values.
+services:
+  ollama:
+    # pinned: unpinned tags drift silently; bump deliberately (see RUNBOOK.md
+    # "Updating"). 0.40.2 = latest stable as of the 2026-10-09 audit.
+    image: ollama/ollama:0.40.2
+    container_name: pai-ollama
+    restart: unless-stopped
+    volumes:
+      - ollama-models:/root/.ollama
+    environment:
+      - OLLAMA_KEEP_ALIVE=30m
+    # GPU hosts (NVIDIA, requires nvidia-container-toolkit): uncomment the block
+    # below and read RUNBOOK.md "GPU" before starting.
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+    networks: [pai]
+
+  open-webui:
+    # pinned: :main is the vendor's "latest build" and can break without
+    # warning. v0.11.4 = latest stable as of the 2026-10-09 audit.
+    image: ghcr.io/open-webui/open-webui:v0.11.4
+    container_name: pai-webui
+    restart: unless-stopped
+    depends_on: [ollama]
+    environment:
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - WEBUI_AUTH=${WEBUI_AUTH:-true}
+      # Random secret required since Open WebUI 0.5.x — without it the UI
+      # refuses to start (JWT signing). install.sh generates one into .env.
+      - WEBUI_SECRET_KEY=${WEBUI_SECRET_KEY}
+    volumes:
+      - webui-data:/app/backend/data
+    ports:
+      # loopback only: lets you smoke-test before DNS/TLS exist without exposing
+      # the UI to the internet. Caddy is the only public entry point.
+      - "127.0.0.1:8080:8080"
+    networks: [pai]
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: pai-caddy
+    restart: unless-stopped
+    depends_on: [open-webui]
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      - DOMAIN=${DOMAIN}
+      - EMAIL=${ACME_EMAIL}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    networks: [pai]
+
+  restic-backup:
+    # pinned: restic:latest fails to extract on Docker 29's containerd image store
+    # ("unable to prepare extraction snapshot: AlreadyExists"). Bump deliberately,
+    # see RUNBOOK.md "Updating".
+    image: restic/restic:0.18.0
+    container_name: pai-backup
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        while true; do
+          if ! restic snapshots >/dev/null 2>&1; then
+            echo "[backup] initialising repository"; restic init || echo "[backup] INIT FAILED"
+          fi
+          restic backup /data || echo "[backup] BACKUP FAILED"
+          sleep 86400
+        done
+    environment:
+      - RESTIC_REPOSITORY=${RESTIC_REPOSITORY}
+      - RESTIC_PASSWORD=${RESTIC_PASSWORD}
+    volumes:
+      - webui-data:/data:ro
+      # BACKUP_DIR is the host directory behind RESTIC_REPOSITORY when you use a
+      # local path. Point RESTIC_REPOSITORY at s3:/b2:/sftp: instead and this
+      # mount is simply unused.
+      - ${BACKUP_DIR:-./backups}:/backups
+    networks: [pai]
+
+networks:
+  pai:
+
+volumes:
+  ollama-models:
+  webui-data:
+  caddy-data:
+  caddy-config:
